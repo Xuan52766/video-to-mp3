@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Files
@@ -23,7 +23,7 @@ if (-not $ffmpegCmd -or -not $ffprobeCmd) {
 
 # 支援的常見影片副檔名
 $supportedExtensions = @(".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".wmv", ".ts", ".m4v", ".m2ts")
-$targetFiles = [System.Collections.Generic.List[string]]::new()
+$collectedFiles = [System.Collections.Generic.List[string]]::new()
 
 # 2. 收集待處理檔案（使用 -LiteralPath 避免檔名包含 [ ] 等特殊符號被視為萬用字元）
 if ($Files -and $Files.Count -gt 0) {
@@ -31,12 +31,12 @@ if ($Files -and $Files.Count -gt 0) {
         $cleanPath = $item.Trim('"').Trim("'")
         if (Test-Path -LiteralPath $cleanPath -PathType Container) {
             Get-ChildItem -LiteralPath $cleanPath -File | Where-Object { $supportedExtensions -contains $_.Extension.ToLower() } | ForEach-Object {
-                $targetFiles.Add($_.FullName)
+                $collectedFiles.Add($_.FullName)
             }
         } elseif (Test-Path -LiteralPath $cleanPath -PathType Leaf) {
             $ext = [System.IO.Path]::GetExtension($cleanPath).ToLower()
             if ($supportedExtensions -contains $ext) {
-                $targetFiles.Add((Resolve-Path -LiteralPath $cleanPath).Path)
+                $collectedFiles.Add((Resolve-Path -LiteralPath $cleanPath).Path)
             }
         }
     }
@@ -49,12 +49,15 @@ if ($Files -and $Files.Count -gt 0) {
 
     foreach ($sDir in $searchDirs) {
         Get-ChildItem -LiteralPath $sDir -File | Where-Object { $supportedExtensions -contains $_.Extension.ToLower() } | ForEach-Object {
-            if (-not $targetFiles.Contains($_.FullName)) {
-                $targetFiles.Add($_.FullName)
+            if (-not $collectedFiles.Contains($_.FullName)) {
+                $collectedFiles.Add($_.FullName)
             }
         }
     }
 }
+
+# 檔案去重複
+$targetFiles = @($collectedFiles | Select-Object -Unique)
 
 if ($targetFiles.Count -eq 0) {
     Write-Host ""
@@ -73,16 +76,26 @@ Write-Host "==========================================================" -Foregro
 
 $successCount = 0
 $failCount = 0
+$skipCount = 0
+
+# 定義無損 / 未壓縮音訊編碼清單
+$losslessCodecs = @("flac", "alac", "wavpack", "truehd", "ape")
 
 foreach ($file in $targetFiles) {
     $dir = [System.IO.Path]::GetDirectoryName($file)
     $fileNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($file)
     $outputMp3 = Join-Path $dir "$fileNameWithoutExt.mp3"
+    $tempMp3 = Join-Path $dir "$fileNameWithoutExt.tmp.mp3"
 
     Write-Host ""
     Write-Host "----------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "[正在處理] $fileNameWithoutExt" -ForegroundColor White
     Write-Host "來源路徑: $file" -ForegroundColor DarkGray
+
+    # 清理可能遺留的暫存檔
+    if (Test-Path -LiteralPath $tempMp3) {
+        Remove-Item -LiteralPath $tempMp3 -Force -ErrorAction SilentlyContinue
+    }
 
     # 3. 取得音訊編碼名稱
     $codecOutput = & ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$file" 2>$null
@@ -90,14 +103,20 @@ foreach ($file in $targetFiles) {
 
     if (-not $codec) {
         Write-Host "  [跳過] 未偵測到音訊串流或無法讀取音軌。" -ForegroundColor Yellow
-        $failCount++
+        $skipCount++
         continue
     }
 
-    # 4. 判斷音訊編碼
+    # 4. 判斷音訊編碼並執行轉碼至暫存檔
+    $isLossless = ($losslessCodecs -contains $codec.ToLower()) -or ($codec.ToLower() -like "pcm_*")
+
     if ($codec.ToLower() -eq "mp3") {
         Write-Host "  -> 原音訊即為 MP3，採用無損直接複製 (-c:a copy)，極速且零失真！" -ForegroundColor Green
-        & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a copy "$outputMp3"
+        & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a copy "$tempMp3"
+    } elseif ($isLossless) {
+        Write-Host "  -> 原音訊為無損/高保真編碼 ($codec)" -ForegroundColor Cyan
+        Write-Host "  -> 自動採用 MP3 上限 320 kbps (智慧 ABR) 進行轉碼..." -ForegroundColor DarkCyan
+        & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a libmp3lame -abr 1 -b:a 320k "$tempMp3"
     } else {
         # 多層深度探測位元速率 (bit_rate)
         # 第一層：從串流標頭讀取 bit_rate
@@ -124,9 +143,11 @@ foreach ($file in $targetFiles) {
         $parsedBps = 0.0
         $bitrateArg = "192k"
 
-        if ($rawBitrate -and $rawBitrate -ne "N/A" -and [double]::TryParse($rawBitrate, [ref]$parsedBps) -and $parsedBps -gt 0) {
-            $targetKbps = [math]::Round($parsedBps / 1000)
-            Write-Host "  -> 原音訊編碼: $codec | 偵測到原始平均速率: ${targetKbps} kbps" -ForegroundColor Cyan
+        if ($rawBitrate -and $rawBitrate -ne "N/A" -and [double]::TryParse($rawBitrate, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsedBps) -and $parsedBps -gt 0) {
+            $rawKbps = [int][math]::Round($parsedBps / 1000)
+            # MP3 規格安全上下限保護 (32 kbps ~ 320 kbps)
+            $targetKbps = [math]::Min(320, [math]::Max(32, $rawKbps))
+            Write-Host "  -> 原音訊編碼: $codec | 偵測到原始平均速率: ${rawKbps} kbps (目標: ${targetKbps} kbps)" -ForegroundColor Cyan
             Write-Host "  -> 採用智慧 ABR 動態速率 (-abr 1 -b:a ${targetKbps}k) 進行轉碼..." -ForegroundColor DarkCyan
             $bitrateArg = "${targetKbps}k"
         } else {
@@ -135,24 +156,30 @@ foreach ($file in $targetFiles) {
             $bitrateArg = "192k"
         }
 
-        # 啟用 -abr 1 (Average Bit Rate) 動態位元速率編碼
-        & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a libmp3lame -abr 1 -b:a $bitrateArg "$outputMp3"
+        # 啟用 -abr 1 (Average Bit Rate) 動態位元速率編碼至暫存檔
+        & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a libmp3lame -abr 1 -b:a $bitrateArg "$tempMp3"
     }
 
-    # 使用 -LiteralPath 精準檢查輸出檔案（支援包含中括號 [] 的檔名）
-    if (Test-Path -LiteralPath $outputMp3) {
+    $ffmpegExitCode = $LASTEXITCODE
+
+    # 5. 嚴格成功判定：確認 FFmpeg 退出碼為 0、暫存檔存在且大小大於 0 位元組
+    if ($ffmpegExitCode -eq 0 -and (Test-Path -LiteralPath $tempMp3 -PathType Leaf) -and ((Get-Item -LiteralPath $tempMp3).Length -gt 0)) {
+        Move-Item -LiteralPath $tempMp3 -Destination $outputMp3 -Force
         $outSize = (Get-Item -LiteralPath $outputMp3).Length
         $sizeMB = [math]::Round($outSize / 1MB, 2)
         Write-Host "  [完成] 轉檔成功！檔案大小: $sizeMB MB" -ForegroundColor Green
         Write-Host "  輸出位置: $outputMp3" -ForegroundColor Gray
         $successCount++
     } else {
-        Write-Host "  [失敗] FFmpeg 執行後未產生目標 MP3 檔案。" -ForegroundColor Red
+        Write-Host "  [失敗] FFmpeg 轉檔失敗 (退出代碼: $ffmpegExitCode)" -ForegroundColor Red
+        if (Test-Path -LiteralPath $tempMp3) {
+            Remove-Item -LiteralPath $tempMp3 -Force -ErrorAction SilentlyContinue
+        }
         $failCount++
     }
 }
 
 Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "  處理完成！成功: $successCount 個，失敗/跳過: $failCount 個" -ForegroundColor Cyan
+Write-Host "  處理完成！成功: $successCount 個，失敗: $failCount 個，跳過: $skipCount 個" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
