@@ -15,7 +15,9 @@ $ffprobeCmd = Get-Command "ffprobe" -ErrorAction SilentlyContinue
 if (-not $ffmpegCmd -or -not $ffprobeCmd) {
     Write-Host ""
     Write-Host "[錯誤] 系統中找不到 ffmpeg 或 ffprobe！" -ForegroundColor Red
-    Write-Host "請確認已將 FFmpeg 的 bin 目錄加入 Windows 系統環境變數 PATH 中。" -ForegroundColor Yellow
+    Write-Host "建議安裝方式（開啟 PowerShell 貼上並執行）：" -ForegroundColor Cyan
+    Write-Host "   winget install Gyan.FFmpeg" -ForegroundColor Yellow
+    Write-Host "   或至官網下載：https://ffmpeg.org/download.html`n" -ForegroundColor Gray
     exit 1
 }
 
