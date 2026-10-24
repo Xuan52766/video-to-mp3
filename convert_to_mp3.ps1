@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Files
@@ -67,7 +67,7 @@ if ($targetFiles.Count -eq 0) {
 }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "  影片一鍵轉 MP3 工具 (自動匹配原音訊位元速率)" -ForegroundColor Cyan
+Write-Host "  影片一鍵轉 MP3 工具 (智慧 ABR 動態位元速率匹配)" -ForegroundColor Cyan
 Write-Host "  找到 $($targetFiles.Count) 個待處理影片" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
@@ -99,15 +99,25 @@ foreach ($file in $targetFiles) {
         Write-Host "  -> 原音訊即為 MP3，採用無損直接複製 (-c:a copy)，極速且零失真！" -ForegroundColor Green
         & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a copy "$outputMp3"
     } else {
-        # 取得位元速率 (bit_rate)
+        # 多層深度探測位元速率 (bit_rate)
+        # 第一層：從串流標頭讀取 bit_rate
         $rawBitrateOutput = & ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 "$file" 2>$null
         $rawBitrate = if ($rawBitrateOutput) { ($rawBitrateOutput -join "").Trim() } else { "" }
 
-        # 若 stream 查無，嘗試從 tag BPS 讀取
+        # 第二層：從串流標籤讀取 BPS / BPS-eng
         if (-not $rawBitrate -or $rawBitrate -eq "N/A" -or $rawBitrate -eq "0") {
             $bpsTagOutput = & ffprobe -v error -select_streams a:0 -show_entries stream_tags=BPS,BPS-eng -of default=noprint_wrappers=1:nokey=1 "$file" 2>$null
             if ($bpsTagOutput) {
                 $rawBitrate = ($bpsTagOutput -join "").Trim()
+            }
+        }
+
+        # 第三層：針對動態 VBR AAC 等容器未標記的情形，調用 ffmpeg 解析串流平均速率
+        if (-not $rawBitrate -or $rawBitrate -eq "N/A" -or $rawBitrate -eq "0") {
+            $ffmpegProbe = (& ffmpeg -hide_banner -i "$file" 2>&1) -join "`n"
+            if ($ffmpegProbe -match "Stream #\d+:\d+.*?: Audio:.*?,\s*(\d+)\s*kb/s") {
+                $detectedKbps = [int]$Matches[1]
+                $rawBitrate = [string]($detectedKbps * 1000)
             }
         }
 
@@ -116,16 +126,17 @@ foreach ($file in $targetFiles) {
 
         if ($rawBitrate -and $rawBitrate -ne "N/A" -and [double]::TryParse($rawBitrate, [ref]$parsedBps) -and $parsedBps -gt 0) {
             $targetKbps = [math]::Round($parsedBps / 1000)
-            Write-Host "  -> 原音訊編碼: $codec | 偵測到原始速率: ${targetKbps} kbps" -ForegroundColor Cyan
-            Write-Host "  -> 採用目標速率: ${targetKbps}k 進行 libmp3lame 轉碼..." -ForegroundColor DarkCyan
+            Write-Host "  -> 原音訊編碼: $codec | 偵測到原始平均速率: ${targetKbps} kbps" -ForegroundColor Cyan
+            Write-Host "  -> 採用智慧 ABR 動態速率 (-abr 1 -b:a ${targetKbps}k) 進行轉碼..." -ForegroundColor DarkCyan
             $bitrateArg = "${targetKbps}k"
         } else {
             Write-Host "  -> 原音訊編碼: $codec | 容器未記錄固定位元速率" -ForegroundColor Yellow
-            Write-Host "  -> 自動採用高品質 192 kbps 進行轉碼..." -ForegroundColor Yellow
+            Write-Host "  -> 自動採用高品質保底 192 kbps (智慧 ABR) 進行轉碼..." -ForegroundColor Yellow
             $bitrateArg = "192k"
         }
 
-        & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a libmp3lame -b:a $bitrateArg "$outputMp3"
+        # 啟用 -abr 1 (Average Bit Rate) 動態位元速率編碼
+        & ffmpeg -hide_banner -loglevel error -stats -y -i "$file" -map 0:a:0 -c:a libmp3lame -abr 1 -b:a $bitrateArg "$outputMp3"
     }
 
     # 使用 -LiteralPath 精準檢查輸出檔案（支援包含中括號 [] 的檔名）
